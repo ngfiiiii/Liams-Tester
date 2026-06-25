@@ -2,24 +2,46 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 import discord
-from discord import app_commands
 from aiohttp import web
+from discord import app_commands
 
 from config import settings
-from ocr import extract_session_id_from_image, normalize_session_id
-from tracker import scrape_session, fill_missing_pr, LobbyScoutError
 from models import PlayerResult, TeamResult
+from ocr import extract_session_id_from_image, normalize_session_id
+from tracker import LobbyScoutError, fill_missing_pr, scrape_session
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("lobby-scout")
 
 VALID_REGIONS = ["NAC", "NAE", "NAW", "EU", "BR", "OCE", "ASIA", "ME"]
 VALID_PLATFORMS = ["pc", "console", "mobile"]
+
+# Fixed automatically for every live command. Users no longer need to enter these.
+LIVE_POLL_SECONDS = 10
+LIVE_MAX_MINUTES = 27
+
+# expected_teams is used for the progress display. The monitor always keeps every
+# team returned by Fortnite Tracker, even if more than the expected count appears.
+LOBBY_FORMATS = {
+    "solos": {"label": "Solos", "team_size": 1, "expected_teams": 100},
+    "duos": {"label": "Duos", "team_size": 2, "expected_teams": 50},
+    "trios": {"label": "Trios", "team_size": 3, "expected_teams": 34},
+    "squads": {"label": "Squads", "team_size": 4, "expected_teams": 25},
+}
+
+FORMAT_CHOICES = [
+    app_commands.Choice(name="Solos — up to 100 players", value="solos"),
+    app_commands.Choice(name="Duos — up to 50 teams", value="duos"),
+    app_commands.Choice(name="Trios — up to 34 teams", value="trios"),
+    app_commands.Choice(name="Squads — up to 25 teams", value="squads"),
+]
+
 SORT_CHOICES = {
     "alive_pr": "Alive First + PR",
     "pr": "Most PR",
@@ -33,7 +55,7 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Message id -> active monitor. This is in-memory, so a Railway redeploy/restart stops old monitors.
+# Message id -> active monitor. Railway restarts clear in-memory monitors.
 active_monitors: dict[int, "LiveMonitor"] = {}
 
 
@@ -43,6 +65,10 @@ def fmt_num(n: float | int | None) -> str:
     if isinstance(n, float) and n.is_integer():
         n = int(n)
     return f"{n:,.0f}" if isinstance(n, (int, float)) else str(n)
+
+
+def format_info(lobby_format: str) -> dict[str, int | str]:
+    return LOBBY_FORMATS.get(lobby_format, LOBBY_FORMATS["duos"])
 
 
 def team_key(team: TeamResult) -> str:
@@ -95,11 +121,6 @@ def player_pr_map(players: list[PlayerResult]) -> dict[str, float]:
 
 
 def team_names_with_pr(team: TeamResult, pr_by_name: dict[str, float] | None = None) -> str:
-    """Render each player name with their own PR next to it.
-
-    Example: PlayerA `9,100 PR` / PlayerB `4,200 PR`
-    Falls back to `0 PR` when Tracker has not exposed a player PR yet.
-    """
     if not team.players:
         return "Unknown team"
     pr_by_name = pr_by_name or {}
@@ -113,11 +134,10 @@ def team_names_with_pr(team: TeamResult, pr_by_name: dict[str, float] | None = N
 def team_line(rank: int, team: TeamResult, pr_by_name: dict[str, float] | None = None) -> str:
     icon = "💀" if team.is_eliminated else "🟢"
     names = team_names_with_pr(team, pr_by_name)
-    pr = fmt_num(team.combined_pr)
     status = "alive"
     if team.is_eliminated:
         place = f"#{team.placement}" if team.placement is not None else "#?"
-        when = f" at {team.eliminated_at}" if team.eliminated_at else ""
+        when = f" @ {team.eliminated_at}" if team.eliminated_at else ""
         status = f"placed {place}{when}"
     extra = []
     if team.eliminations is not None:
@@ -125,7 +145,10 @@ def team_line(rank: int, team: TeamResult, pr_by_name: dict[str, float] | None =
     if team.points is not None:
         extra.append(f"{team.points} pts")
     extra_txt = f" • {' • '.join(extra)}" if extra else ""
-    return f"`{rank:02}` {icon} {names} — **Team:** `{pr} PR` • {status}{extra_txt}"
+    return (
+        f"`{rank:02}` {icon} {names} — **Team:** `{fmt_num(team.combined_pr)} PR` "
+        f"• {status}{extra_txt}"
+    )
 
 
 def player_line(rank: int, player: PlayerResult) -> str:
@@ -135,48 +158,142 @@ def player_line(rank: int, player: PlayerResult) -> str:
     return f"`{rank:02}` **{player.name}** — `{fmt_num(player.pr)} PR`{kills}{dmg}{place}"
 
 
-def make_embed(
-    session_id: str,
-    url: str,
-    players: list[PlayerResult],
+def make_text_pages(lines: list[str], max_chars: int = 950) -> list[str]:
+    """Split rows into Discord-safe embed field pages while preserving every row."""
+    if not lines:
+        return ["No teams found yet. The session may still be processing."]
+
+    pages: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        # Discord field values are limited to 1024 characters.
+        safe_line = line[:900]
+        extra = len(safe_line) + (1 if current else 0)
+        if current and current_len + extra > max_chars:
+            pages.append("\n".join(current))
+            current = [safe_line]
+            current_len = len(safe_line)
+        else:
+            current.append(safe_line)
+            current_len += extra
+    if current:
+        pages.append("\n".join(current))
+    return pages or ["No rows found."]
+
+
+def build_team_pages(
     teams: list[TeamResult],
-    top: int,
-    region: str,
-    platform: str,
-) -> discord.Embed:
-    top = max(1, min(top, settings.max_rows))
+    players: list[PlayerResult],
+    sort_mode: str,
+) -> list[str]:
+    pr_by_name = player_pr_map(players)
+    ordered = sort_teams(teams, sort_mode)
+    lines = [team_line(i, team, pr_by_name) for i, team in enumerate(ordered, start=1)]
+    return make_text_pages(lines)
+
+
+def clamp_page(page: int, pages: list[str]) -> int:
+    return max(0, min(page, max(0, len(pages) - 1)))
+
+
+@dataclass
+class StaticLobbyState:
+    session_id: str
+    url: str
+    players: list[PlayerResult]
+    teams: list[TeamResult]
+    region: str
+    platform: str
+    lobby_format: str
+    page: int = 0
+
+    def pages(self) -> list[str]:
+        if self.teams:
+            return build_team_pages(self.teams, self.players, "pr")
+        lines = [player_line(i, p) for i, p in enumerate(self.players, start=1)]
+        return make_text_pages(lines)
+
+
+def make_static_embed(state: StaticLobbyState, detected_from_ocr: bool = False) -> discord.Embed:
+    info = format_info(state.lobby_format)
+    pages = state.pages()
+    state.page = clamp_page(state.page, pages)
+    expected = int(info["expected_teams"])
+    known = len(state.teams) if state.teams else len(state.players)
+    unit = "players" if state.lobby_format == "solos" else "teams"
+
     embed = discord.Embed(
         title="Lobby Scout Results",
-        description=f"[`{session_id}`]({url}) • Region `{region}` • Platform `{platform}`",
+        description=(
+            f"[`{state.session_id}`]({state.url}) • `{info['label']}` • "
+            f"Region `{state.region}` • Platform `{state.platform}`"
+        ),
         color=0x5865F2,
     )
-
-    pr_by_name = player_pr_map(players)
-
-    if teams:
-        lines = [team_line(i, t, pr_by_name) for i, t in enumerate(sort_teams(teams, "pr")[:top], start=1)]
-        embed.add_field(
-            name=f"Top Teams by Combined PR ({min(top, len(teams))}/{len(teams)})",
-            value="\n".join(lines)[:3900] or "No teams found.",
-            inline=False,
-        )
-
-    if players:
-        lines = [player_line(i, p) for i, p in enumerate(players[:top], start=1)]
-        embed.add_field(name=f"Top Players by PR ({min(top, len(players))}/{len(players)})", value="\n".join(lines)[:3900], inline=False)
-
-    if not players and not teams:
-        embed.add_field(
-            name="No roster found",
-            value=(
-                "The session page loaded, but I could not parse roster/stats yet. "
-                "This can happen if the match has not processed, the ID is wrong, or Fortnite Tracker changed the page."
-            ),
-            inline=False,
-        )
-
-    embed.set_footer(text="External OCR + Fortnite Tracker page parsing only. No memory reading or packet sniffing.")
+    embed.add_field(
+        name="Lobby Coverage",
+        value=(
+            f"Found `{known}` of up to `{expected}` {unit}. "
+            "Every returned entry is included across the pages below."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"PR Ranking • Page {state.page + 1}/{len(pages)}",
+        value=pages[state.page][:1024],
+        inline=False,
+    )
+    if detected_from_ocr:
+        embed.add_field(name="OCR", value="Session ID extracted from the uploaded screenshot.", inline=False)
+    embed.set_footer(text="Use Previous/Next to view the full lobby. Sorted by highest combined PR.")
     return embed
+
+
+class StaticPreviousButton(discord.ui.Button):
+    def __init__(self, view: "StaticLobbyView"):
+        super().__init__(style=discord.ButtonStyle.secondary, label="Previous", emoji="⬅️", row=0)
+        self.owner_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.owner_view.state.page -= 1
+        self.owner_view.sync_buttons()
+        await interaction.response.edit_message(
+            embed=make_static_embed(self.owner_view.state, self.owner_view.detected_from_ocr),
+            view=self.owner_view,
+        )
+
+
+class StaticNextButton(discord.ui.Button):
+    def __init__(self, view: "StaticLobbyView"):
+        super().__init__(style=discord.ButtonStyle.secondary, label="Next", emoji="➡️", row=0)
+        self.owner_view = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.owner_view.state.page += 1
+        self.owner_view.sync_buttons()
+        await interaction.response.edit_message(
+            embed=make_static_embed(self.owner_view.state, self.owner_view.detected_from_ocr),
+            view=self.owner_view,
+        )
+
+
+class StaticLobbyView(discord.ui.View):
+    def __init__(self, state: StaticLobbyState, detected_from_ocr: bool):
+        super().__init__(timeout=900)
+        self.state = state
+        self.detected_from_ocr = detected_from_ocr
+        self.previous = StaticPreviousButton(self)
+        self.next = StaticNextButton(self)
+        self.add_item(self.previous)
+        self.add_item(self.next)
+        self.sync_buttons()
+
+    def sync_buttons(self) -> None:
+        pages = self.state.pages()
+        self.state.page = clamp_page(self.state.page, pages)
+        self.previous.disabled = self.state.page <= 0
+        self.next.disabled = self.state.page >= len(pages) - 1
 
 
 @dataclass
@@ -194,19 +311,18 @@ class LiveMonitor:
         session_id_or_url: str,
         region: str,
         platform: str,
-        top: int,
-        poll_seconds: int,
-        max_minutes: int,
+        lobby_format: str,
     ):
         self.message = message
         self.session_id_or_url = session_id_or_url
         self.session_id = normalize_session_id(session_id_or_url) or session_id_or_url
         self.region = region
         self.platform = platform
-        self.top = max(5, min(top, settings.max_rows))
-        self.poll_seconds = max(5, poll_seconds)
-        self.max_minutes = max(1, max_minutes)
+        self.lobby_format = lobby_format
+        self.poll_seconds = LIVE_POLL_SECONDS
+        self.max_minutes = LIVE_MAX_MINUTES
         self.sort_mode = "alive_pr"
+        self.page = 0
         self.started_at = time.monotonic()
         self.stopped = False
         self.task: Optional[asyncio.Task] = None
@@ -224,6 +340,11 @@ class LiveMonitor:
 
     def stop(self) -> None:
         self.stopped = True
+
+    def pages(self) -> list[str]:
+        if not self.snapshot:
+            return ["Starting live monitor…"]
+        return build_team_pages(self.snapshot.teams, self.snapshot.players, self.sort_mode)
 
     async def run(self) -> None:
         deadline = self.started_at + (self.max_minutes * 60)
@@ -265,6 +386,7 @@ class LiveMonitor:
             players=players,
             teams=teams,
         )
+        self.page = clamp_page(self.page, self.pages())
 
     async def refresh_and_edit(self) -> None:
         try:
@@ -275,8 +397,9 @@ class LiveMonitor:
         await self.edit_message()
 
     async def edit_message(self, final: bool = False) -> None:
-        embed = make_live_embed(self, final=final)
-        await self.message.edit(embed=embed, view=self.view)
+        if self.view:
+            self.view.sync_controls()
+        await self.message.edit(embed=make_live_embed(self, final=final), view=self.view)
 
 
 class SortSelect(discord.ui.Select):
@@ -286,18 +409,44 @@ class SortSelect(discord.ui.Select):
             discord.SelectOption(label=label, value=value, default=(monitor.sort_mode == value))
             for value, label in SORT_CHOICES.items()
         ]
-        super().__init__(placeholder="Sort lobby…", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Sort lobby…", min_values=1, max_values=1, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.monitor.sort_mode = self.values[0]
+        self.monitor.page = 0
         if self.monitor.view:
             self.monitor.view.refresh_select_options()
+            self.monitor.view.sync_controls()
+        await interaction.response.edit_message(embed=make_live_embed(self.monitor), view=self.monitor.view)
+
+
+class LivePreviousButton(discord.ui.Button):
+    def __init__(self, monitor: LiveMonitor):
+        super().__init__(style=discord.ButtonStyle.secondary, label="Previous", emoji="⬅️", row=1)
+        self.monitor = monitor
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.monitor.page -= 1
+        if self.monitor.view:
+            self.monitor.view.sync_controls()
+        await interaction.response.edit_message(embed=make_live_embed(self.monitor), view=self.monitor.view)
+
+
+class LiveNextButton(discord.ui.Button):
+    def __init__(self, monitor: LiveMonitor):
+        super().__init__(style=discord.ButtonStyle.secondary, label="Next", emoji="➡️", row=1)
+        self.monitor = monitor
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.monitor.page += 1
+        if self.monitor.view:
+            self.monitor.view.sync_controls()
         await interaction.response.edit_message(embed=make_live_embed(self.monitor), view=self.monitor.view)
 
 
 class RefreshButton(discord.ui.Button):
     def __init__(self, monitor: LiveMonitor):
-        super().__init__(style=discord.ButtonStyle.primary, label="Refresh Now", emoji="🔄")
+        super().__init__(style=discord.ButtonStyle.primary, label="Refresh", emoji="🔄", row=1)
         self.monitor = monitor
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -307,7 +456,7 @@ class RefreshButton(discord.ui.Button):
 
 class StopButton(discord.ui.Button):
     def __init__(self, monitor: LiveMonitor):
-        super().__init__(style=discord.ButtonStyle.danger, label="Stop Live", emoji="🛑")
+        super().__init__(style=discord.ButtonStyle.danger, label="Stop Live", emoji="🛑", row=1)
         self.monitor = monitor
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -321,16 +470,28 @@ class LiveLobbyView(discord.ui.View):
     def __init__(self, monitor: LiveMonitor):
         super().__init__(timeout=monitor.max_minutes * 60 + 120)
         self.monitor = monitor
+        self.previous = LivePreviousButton(monitor)
+        self.next = LiveNextButton(monitor)
+        self.refresh = RefreshButton(monitor)
+        self.stop = StopButton(monitor)
         self.add_item(SortSelect(monitor))
-        self.add_item(RefreshButton(monitor))
-        self.add_item(StopButton(monitor))
+        self.add_item(self.previous)
+        self.add_item(self.next)
+        self.add_item(self.refresh)
+        self.add_item(self.stop)
+        self.sync_controls()
 
     def refresh_select_options(self) -> None:
-        # Rebuild the select so Discord shows the new default option.
         for item in list(self.children):
             if isinstance(item, SortSelect):
                 self.remove_item(item)
         self.add_item(SortSelect(self.monitor))
+
+    def sync_controls(self) -> None:
+        pages = self.monitor.pages()
+        self.monitor.page = clamp_page(self.monitor.page, pages)
+        self.previous.disabled = self.monitor.page <= 0 or self.monitor.stopped
+        self.next.disabled = self.monitor.page >= len(pages) - 1 or self.monitor.stopped
 
     async def on_timeout(self) -> None:
         self.monitor.stop()
@@ -343,11 +504,15 @@ class LiveLobbyView(discord.ui.View):
 
 def make_live_embed(monitor: LiveMonitor, final: bool = False) -> discord.Embed:
     snap = monitor.snapshot
+    info = format_info(monitor.lobby_format)
     url = f"https://fortnitetracker.com/events/sessions/{monitor.session_id}"
     title_suffix = "Ended" if final or monitor.stopped else "Live"
     embed = discord.Embed(
         title=f"Lobby Scout Live • {title_suffix}",
-        description=f"[`{monitor.session_id}`]({url}) • Region `{monitor.region}` • Platform `{monitor.platform}`",
+        description=(
+            f"[`{monitor.session_id}`]({url}) • `{info['label']}` • "
+            f"Region `{monitor.region}` • Platform `{monitor.platform}`"
+        ),
         color=0x2ECC71 if not final and not monitor.stopped else 0x95A5A6,
     )
 
@@ -361,41 +526,57 @@ def make_live_embed(monitor: LiveMonitor, final: bool = False) -> discord.Embed:
         players = snap.players
         pr_by_name = player_pr_map(players)
         known, alive, eliminated = summarize_status(teams)
+        expected = int(info["expected_teams"])
+        pending = max(0, expected - known)
         sort_label = SORT_CHOICES.get(monitor.sort_mode, monitor.sort_mode)
+        unit = "players" if monitor.lobby_format == "solos" else "teams"
+        pages = monitor.pages()
+        monitor.page = clamp_page(monitor.page, pages)
+
         embed.add_field(
             name="Live Summary",
             value=(
-                f"**Known teams:** `{known}` • **Alive/incomplete:** `{alive}` • **Eliminated:** `{eliminated}`\n"
-                f"**Sort:** `{sort_label}` • **Refresh:** every `{monitor.poll_seconds}s` • "
+                f"**Format:** `{info['label']}` • **Tracked:** `{known}/{expected}` {unit} • "
+                f"**Pending:** `{pending}`\n"
+                f"**Alive/incomplete:** `{alive}` • **Eliminated:** `{eliminated}` • "
+                f"**Sort:** `{sort_label}`\n"
+                f"**Auto refresh:** `{monitor.poll_seconds}s` • "
                 f"**Timer:** `{elapsed//60}:{elapsed%60:02}` / `{max_seconds//60}:{max_seconds%60:02}`"
             ),
             inline=False,
         )
 
         if monitor.new_deaths:
-            lines = [team_line(i, t, pr_by_name) for i, t in enumerate(monitor.new_deaths[:5], start=1)]
-            embed.add_field(name="🚨 Newly Eliminated", value="\n".join(lines)[:1000], inline=False)
+            death_lines = [team_line(i, t, pr_by_name) for i, t in enumerate(monitor.new_deaths[:4], start=1)]
+            embed.add_field(
+                name="🚨 Newly Eliminated",
+                value=make_text_pages(death_lines, max_chars=950)[0][:1024],
+                inline=False,
+            )
 
-        sorted_list = sort_teams(teams, monitor.sort_mode)
-        lines = [team_line(i, t, pr_by_name) for i, t in enumerate(sorted_list[:monitor.top], start=1)]
         embed.add_field(
-            name=f"Teams ({min(monitor.top, len(teams))}/{len(teams)})",
-            value="\n".join(lines)[:3900] or "No teams found yet. The session may still be processing.",
+            name=f"Full Lobby • Page {monitor.page + 1}/{len(pages)}",
+            value=pages[monitor.page][:1024],
             inline=False,
         )
 
-        top_players = sorted(players, key=lambda p: p.pr, reverse=True)[:5]
+        top_players = sorted(players, key=lambda p: p.pr, reverse=True)[:3]
         if top_players:
             embed.add_field(
                 name="Highest PR Players",
-                value="\n".join(player_line(i, p) for i, p in enumerate(top_players, start=1))[:1000],
+                value="\n".join(player_line(i, p) for i, p in enumerate(top_players, start=1))[:1024],
                 inline=False,
             )
 
     if monitor.last_error:
         embed.add_field(name="Last refresh warning", value=f"`{monitor.last_error[:900]}`", inline=False)
 
-    embed.set_footer(text="Live page polling only. No Fortnite memory reading, injection, or packet sniffing.")
+    embed.set_footer(
+        text=(
+            "Every returned team is monitored from the first refresh. Pages only control what is visible. "
+            "No memory reading or packet sniffing."
+        )
+    )
     return embed
 
 
@@ -404,56 +585,52 @@ async def handle_session_lookup(
     session_id_or_url: str,
     region: str,
     platform: str,
-    top: int,
+    lobby_format: str,
     detected_from_ocr: bool = False,
 ) -> None:
     region = (region or settings.default_region).upper()
     platform = (platform or settings.default_platform).lower()
-    top = max(1, min(int(top or settings.top_n), settings.max_rows))
 
     await interaction.followup.send(
-        f"Found session ID `{normalize_session_id(session_id_or_url) or session_id_or_url}`. Fetching Fortnite Tracker roster…",
+        f"Found session ID `{normalize_session_id(session_id_or_url) or session_id_or_url}`. Fetching the full lobby…",
         ephemeral=True,
     )
 
     data = await scrape_session(session_id_or_url)
-    players = data["players"]
+    players = await fill_missing_pr(data["players"], region, platform)
     teams = data["teams"]
 
-    # Optional TRN PR fallback only for missing player PR values.
-    players = await fill_missing_pr(players, region, platform)
-
-    # Recalculate teams after PR fallback.
     pr_by_name = {p.name.lower(): p.pr for p in players}
-    for t in teams:
-        t.combined_pr = sum(pr_by_name.get(name.lower(), 0.0) for name in t.players)
-    teams = sorted(teams, key=lambda t: t.combined_pr, reverse=True)
+    for team in teams:
+        team.combined_pr = sum(pr_by_name.get(name.lower(), 0.0) for name in team.players)
 
-    embed = make_embed(
+    state = StaticLobbyState(
         session_id=data["session_id"],
         url=data["url"],
         players=players,
         teams=teams,
-        top=top,
         region=region,
         platform=platform,
+        lobby_format=lobby_format,
     )
-    if detected_from_ocr:
-        embed.add_field(name="OCR", value="Session ID was extracted from your screenshot.", inline=False)
-    await interaction.followup.send(embed=embed)
+    view = StaticLobbyView(state, detected_from_ocr)
+    await interaction.followup.send(embed=make_static_embed(state, detected_from_ocr), view=view)
 
 
-async def extract_id_or_reply(interaction: discord.Interaction, screenshot: discord.Attachment) -> Optional[str]:
+async def extract_id_or_reply(
+    interaction: discord.Interaction,
+    screenshot: discord.Attachment,
+) -> Optional[str]:
     if not screenshot.content_type or not screenshot.content_type.startswith("image/"):
-        await interaction.followup.send("Attach a normal screenshot image like PNG/JPG/WebP.", ephemeral=True)
+        await interaction.followup.send("Attach a normal screenshot image such as PNG, JPG, or WebP.", ephemeral=True)
         return None
     image_bytes = await screenshot.read()
     session_id, debug_text = extract_session_id_from_image(image_bytes)
     if not session_id:
         short_debug = (debug_text or "").replace("`", "")[:700]
         await interaction.followup.send(
-            "I couldn’t read a valid 32-character session ID from that screenshot. "
-            "Crop closer to the top-right ID or use the ID command with the pasted Fortnite Tracker link/ID.\n\n"
+            "I couldn’t read a valid 32-character session ID. Crop closer to the top-left ID, "
+            "or use the matching `_id` command with a pasted Tracker link/ID.\n\n"
             f"OCR saw: ```{short_debug or 'nothing readable'}```",
             ephemeral=True,
         )
@@ -461,23 +638,24 @@ async def extract_id_or_reply(interaction: discord.Interaction, screenshot: disc
     return session_id
 
 
-@tree.command(name="players", description="Upload a screenshot of the top-right Fortnite match/session ID and rank the lobby by PR.")
+@tree.command(name="players", description="One-time full lobby lookup from a screenshot of the Fortnite session ID.")
 @app_commands.describe(
-    screenshot="Screenshot containing the top-right match/session ID",
-    region="Fortnite event region, default from env. Example: NAC, NAE, EU",
+    screenshot="Screenshot containing the Fortnite match/session ID",
+    mode="Choose Solos, Duos, Trios, or Squads",
+    region="Fortnite event region",
     platform="pc, console, or mobile",
-    top="How many players/teams to show",
 )
 @app_commands.choices(
+    mode=FORMAT_CHOICES,
     region=[app_commands.Choice(name=r, value=r) for r in VALID_REGIONS],
     platform=[app_commands.Choice(name=p, value=p) for p in VALID_PLATFORMS],
 )
 async def players(
     interaction: discord.Interaction,
     screenshot: discord.Attachment,
+    mode: app_commands.Choice[str],
     region: Optional[app_commands.Choice[str]] = None,
     platform: Optional[app_commands.Choice[str]] = None,
-    top: Optional[int] = None,
 ):
     await interaction.response.defer(thinking=True)
     try:
@@ -489,7 +667,7 @@ async def players(
             session_id,
             region.value if region else settings.default_region,
             platform.value if platform else settings.default_platform,
-            top or settings.top_n,
+            mode.value,
             detected_from_ocr=True,
         )
     except LobbyScoutError as exc:
@@ -499,23 +677,24 @@ async def players(
         await interaction.followup.send(f"Unexpected error: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-@tree.command(name="players_id", description="Paste a Fortnite Tracker session URL or 32-character match/session ID.")
+@tree.command(name="players_id", description="One-time full lobby lookup from a Tracker session URL or ID.")
 @app_commands.describe(
-    match_id_or_url="Example: https://fortnitetracker.com/events/sessions/<id>",
-    region="Fortnite event region, default from env. Example: NAC, NAE, EU",
+    match_id_or_url="Fortnite Tracker session URL or 32-character ID",
+    mode="Choose Solos, Duos, Trios, or Squads",
+    region="Fortnite event region",
     platform="pc, console, or mobile",
-    top="How many players/teams to show",
 )
 @app_commands.choices(
+    mode=FORMAT_CHOICES,
     region=[app_commands.Choice(name=r, value=r) for r in VALID_REGIONS],
     platform=[app_commands.Choice(name=p, value=p) for p in VALID_PLATFORMS],
 )
 async def players_id(
     interaction: discord.Interaction,
     match_id_or_url: str,
+    mode: app_commands.Choice[str],
     region: Optional[app_commands.Choice[str]] = None,
     platform: Optional[app_commands.Choice[str]] = None,
-    top: Optional[int] = None,
 ):
     await interaction.response.defer(thinking=True)
     try:
@@ -524,7 +703,7 @@ async def players_id(
             match_id_or_url,
             region.value if region else settings.default_region,
             platform.value if platform else settings.default_platform,
-            top or settings.top_n,
+            mode.value,
             detected_from_ocr=False,
         )
     except LobbyScoutError as exc:
@@ -539,25 +718,24 @@ async def start_live_monitor(
     session_id_or_url: str,
     region: str,
     platform: str,
-    top: int,
-    poll_seconds: int,
-    max_minutes: int,
+    lobby_format: str,
     from_ocr: bool,
 ) -> None:
     region = (region or settings.default_region).upper()
     platform = (platform or settings.default_platform).lower()
-    top = max(5, min(int(top or settings.live_top_teams), settings.max_rows))
-    poll_seconds = max(5, int(poll_seconds or settings.live_poll_seconds))
-    max_minutes = max(1, min(int(max_minutes or settings.live_max_minutes), 120))
     session_id = normalize_session_id(session_id_or_url)
     if not session_id:
         await interaction.followup.send("That does not look like a valid Fortnite Tracker session/match ID.", ephemeral=True)
         return
 
+    info = format_info(lobby_format)
     message = await interaction.followup.send(
         embed=discord.Embed(
             title="Lobby Scout Live • Starting",
-            description=f"[`{session_id}`](https://fortnitetracker.com/events/sessions/{session_id}) • preparing live monitor…",
+            description=(
+                f"[`{session_id}`](https://fortnitetracker.com/events/sessions/{session_id}) • "
+                f"`{info['label']}` • auto-refresh every `{LIVE_POLL_SECONDS}s` for `{LIVE_MAX_MINUTES}` minutes"
+            ),
             color=0x2ECC71,
         ),
         wait=True,
@@ -567,36 +745,31 @@ async def start_live_monitor(
         session_id_or_url=session_id_or_url,
         region=region,
         platform=platform,
-        top=top,
-        poll_seconds=poll_seconds,
-        max_minutes=max_minutes,
+        lobby_format=lobby_format,
     )
     await monitor.start()
     if from_ocr:
-        await interaction.followup.send("OCR found the session ID and the live monitor is running.", ephemeral=True)
+        await interaction.followup.send("OCR found the session ID and the full-lobby monitor is running.", ephemeral=True)
 
 
-@tree.command(name="players_live", description="Live monitor a Fortnite Tracker session from a screenshot ID; updates one message as teams die.")
+@tree.command(name="players_live", description="Live full-lobby monitor from a screenshot; updates as teams are eliminated.")
 @app_commands.describe(
-    screenshot="Screenshot containing the top-right match/session ID",
-    region="Fortnite event region, default from env. Example: NAC, NAE, EU",
+    screenshot="Screenshot containing the Fortnite match/session ID",
+    mode="Choose Solos, Duos, Trios, or Squads",
+    region="Fortnite event region",
     platform="pc, console, or mobile",
-    top="How many teams to show",
-    poll_seconds="How often to refresh. Minimum 5 seconds. Default from env is 10.",
-    max_minutes="How long to keep updating. Default from env is 30.",
 )
 @app_commands.choices(
+    mode=FORMAT_CHOICES,
     region=[app_commands.Choice(name=r, value=r) for r in VALID_REGIONS],
     platform=[app_commands.Choice(name=p, value=p) for p in VALID_PLATFORMS],
 )
 async def players_live(
     interaction: discord.Interaction,
     screenshot: discord.Attachment,
+    mode: app_commands.Choice[str],
     region: Optional[app_commands.Choice[str]] = None,
     platform: Optional[app_commands.Choice[str]] = None,
-    top: Optional[int] = None,
-    poll_seconds: Optional[int] = None,
-    max_minutes: Optional[int] = None,
 ):
     await interaction.response.defer(thinking=True)
     try:
@@ -608,9 +781,7 @@ async def players_live(
             session_id,
             region.value if region else settings.default_region,
             platform.value if platform else settings.default_platform,
-            top or settings.live_top_teams,
-            poll_seconds or settings.live_poll_seconds,
-            max_minutes or settings.live_max_minutes,
+            mode.value,
             from_ocr=True,
         )
     except Exception as exc:
@@ -618,27 +789,24 @@ async def players_live(
         await interaction.followup.send(f"Unexpected error: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-@tree.command(name="players_live_id", description="Live monitor a Fortnite Tracker session URL/ID; updates one message as teams die.")
+@tree.command(name="players_live_id", description="Live full-lobby monitor from a Tracker session URL or ID.")
 @app_commands.describe(
-    match_id_or_url="Example: https://fortnitetracker.com/events/sessions/<id>",
-    region="Fortnite event region, default from env. Example: NAC, NAE, EU",
+    match_id_or_url="Fortnite Tracker session URL or 32-character ID",
+    mode="Choose Solos, Duos, Trios, or Squads",
+    region="Fortnite event region",
     platform="pc, console, or mobile",
-    top="How many teams to show",
-    poll_seconds="How often to refresh. Minimum 5 seconds. Default from env is 10.",
-    max_minutes="How long to keep updating. Default from env is 30.",
 )
 @app_commands.choices(
+    mode=FORMAT_CHOICES,
     region=[app_commands.Choice(name=r, value=r) for r in VALID_REGIONS],
     platform=[app_commands.Choice(name=p, value=p) for p in VALID_PLATFORMS],
 )
 async def players_live_id(
     interaction: discord.Interaction,
     match_id_or_url: str,
+    mode: app_commands.Choice[str],
     region: Optional[app_commands.Choice[str]] = None,
     platform: Optional[app_commands.Choice[str]] = None,
-    top: Optional[int] = None,
-    poll_seconds: Optional[int] = None,
-    max_minutes: Optional[int] = None,
 ):
     await interaction.response.defer(thinking=True)
     try:
@@ -647,9 +815,7 @@ async def players_live_id(
             match_id_or_url,
             region.value if region else settings.default_region,
             platform.value if platform else settings.default_platform,
-            top or settings.live_top_teams,
-            poll_seconds or settings.live_poll_seconds,
-            max_minutes or settings.live_max_minutes,
+            mode.value,
             from_ocr=False,
         )
     except Exception as exc:
@@ -659,7 +825,13 @@ async def players_live_id(
 
 @tree.command(name="bot_status", description="Check whether Lobby Scout Pro is online.")
 async def bot_status(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Lobby Scout Pro is online ✅ Active live monitors: `{len(active_monitors)}`", ephemeral=True)
+    await interaction.response.send_message(
+        (
+            f"Lobby Scout Pro is online ✅ Active live monitors: `{len(active_monitors)}`\n"
+            f"Live defaults: refresh every `{LIVE_POLL_SECONDS}s` for `{LIVE_MAX_MINUTES}` minutes."
+        ),
+        ephemeral=True,
+    )
 
 
 @client.event
@@ -679,11 +851,15 @@ async def on_ready():
 
 
 async def health(request: web.Request) -> web.Response:
-    return web.json_response({
-        "ok": True,
-        "bot": str(client.user) if client.user else None,
-        "active_live_monitors": len(active_monitors),
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "bot": str(client.user) if client.user else None,
+            "active_live_monitors": len(active_monitors),
+            "live_poll_seconds": LIVE_POLL_SECONDS,
+            "live_max_minutes": LIVE_MAX_MINUTES,
+        }
+    )
 
 
 async def start_health_server() -> None:
@@ -698,7 +874,7 @@ async def start_health_server() -> None:
 
 async def main():
     if not settings.discord_token:
-        raise RuntimeError("DISCORD_TOKEN is missing. Add it to your .env or Railway Variables.")
+        raise RuntimeError("DISCORD_TOKEN is missing. Add it to Railway Variables.")
     await start_health_server()
     await client.start(settings.discord_token)
 

@@ -1,22 +1,21 @@
-# Lobby Scout Pro Live — Flat Railway Build
+# Lobby Scout Pro Live v2.3 — Automatic Full-Lobby Build
 
-This build has **no nested code folders**. Upload every file directly to the root of one GitHub repository.
+All project files stay directly in one folder. Upload every extracted file directly to the root of your GitHub repository.
 
-Your repository must look like this:
+## Changes in this build
 
-```text
-main.py
-config.py
-models.py
-ocr.py
-tracker.py
-Dockerfile
-Procfile
-requirements.txt
-README.md
-.env.example
-.dockerignore
-```
+- Live refresh is automatically fixed at **10 seconds**.
+- Live monitoring automatically stops after **27 minutes**.
+- Removed the old `top`, `poll_seconds`, and `max_minutes` command inputs.
+- Every lobby command now asks for **Solos, Duos, Trios, or Squads**.
+- The selected format automatically targets the full lobby:
+  - Solos: up to 100 players
+  - Duos: up to 50 teams
+  - Trios: up to 34 teams
+  - Squads: up to 25 teams
+- The monitor tracks every team returned from the first refresh.
+- Previous/Next buttons let you browse the full lobby without exceeding Discord embed limits.
+- Every player still shows individual PR, with combined team PR and alive/dead state.
 
 ## Railway variables
 
@@ -26,32 +25,31 @@ Required:
 DISCORD_TOKEN=your_bot_token
 ```
 
-Recommended:
+Recommended/optional:
 
 ```text
 DISCORD_GUILD_ID=your_server_id
 DEFAULT_REGION=NAC
 DEFAULT_PLATFORM=pc
-LIVE_POLL_SECONDS=10
-LIVE_MAX_MINUTES=30
-LIVE_TOP_TEAMS=25
 TRN_API_KEY=
 ```
 
-## Deploy
-
-1. Extract the ZIP.
-2. Create a GitHub repository.
-3. Upload all extracted files directly to the repository root. Do not upload the ZIP itself.
-4. In Railway, deploy from that GitHub repository.
-5. Leave Railway's Root Directory blank.
-6. Add the variables above and redeploy.
-7. Test `/bot_status` in Discord.
+You no longer need `LIVE_POLL_SECONDS`, `LIVE_MAX_MINUTES`, `LIVE_TOP_TEAMS`, `TOP_N`, or `MAX_ROWS`.
 
 ## Commands
 
-- `/players` — screenshot, one-time lookup
-- `/players_id` — pasted session ID/link, one-time lookup
-- `/players_live` — screenshot, live updating lobby
-- `/players_live_id` — pasted ID/link, live updating lobby
-- `/bot_status` — bot health check
+```text
+/players screenshot:<image> mode:<Solos|Duos|Trios|Squads>
+/players_id match_id_or_url:<id-or-link> mode:<Solos|Duos|Trios|Squads>
+/players_live screenshot:<image> mode:<Solos|Duos|Trios|Squads>
+/players_live_id match_id_or_url:<id-or-link> mode:<Solos|Duos|Trios|Squads>
+/bot_status
+```
+
+### Example
+
+```text
+/players_live screenshot:<image> mode:Duos region:NAC platform:pc
+```
+
+The bot then checks Fortnite Tracker every 10 seconds for 27 minutes, tracks all returned duo teams, shows individual PR and team PR, marks eliminations, and provides sorting plus page controls.
