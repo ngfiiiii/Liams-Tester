@@ -1,21 +1,25 @@
-# Lobby Scout Pro Live v2.3 — Automatic Full-Lobby Build
+# Lobby Scout Pro Live v2.5 — One-Message Dashboard
 
 All project files stay directly in one folder. Upload every extracted file directly to the root of your GitHub repository.
 
-## Changes in this build
+## New in v2.5
 
-- Live refresh is automatically fixed at **10 seconds**.
-- Live monitoring automatically stops after **27 minutes**.
-- Removed the old `top`, `poll_seconds`, and `max_minutes` command inputs.
-- Every lobby command now asks for **Solos, Duos, Trios, or Squads**.
-- The selected format automatically targets the full lobby:
-  - Solos: up to 100 players
-  - Duos: up to 50 teams
-  - Trios: up to 34 teams
-  - Squads: up to 25 teams
-- The monitor tracks every team returned from the first refresh.
-- Previous/Next buttons let you browse the full lobby without exceeding Discord embed limits.
-- Every player still shows individual PR, with combined team PR and alive/dead state.
+- The full lobby is rendered into **one dashboard image attached to one Discord message**.
+- Duos displays all returned teams in two columns, so a 50-team lobby no longer needs Previous/Next pages.
+- Solos, Trios, and Squads automatically choose enough columns to show the complete returned lobby in one image.
+- Each player keeps their individual PR whether their team is alive or eliminated.
+- Each row also shows combined team PR, alive/out status, placement, elimination time, eliminations, and points when Tracker provides them.
+- Newly eliminated teams are highlighted as **NEW OUT** on the next refresh.
+- The sort menu, Refresh button, and Stop Live button remain available.
+- Live polling remains fixed at **10 seconds** and automatically stops after **27 minutes**.
+
+Discord may scale the image to fit the app window. On a small screen you may need to tap the image to read tiny text, but there is no lobby pagination and all returned teams are contained in the same Discord message.
+
+## PR behavior
+
+PR is collected from Fortnite Tracker's Stats table, live JSON responses, and available fallbacks. Alive/dead status does not remove PR: eliminated teams keep the same individual and combined PR values in the dashboard.
+
+A player may still show `0 PR` when Fortnite Tracker itself has no PR value for that account.
 
 ## Railway variables
 
@@ -34,8 +38,6 @@ DEFAULT_PLATFORM=pc
 TRN_API_KEY=
 ```
 
-You no longer need `LIVE_POLL_SECONDS`, `LIVE_MAX_MINUTES`, `LIVE_TOP_TEAMS`, `TOP_N`, or `MAX_ROWS`.
-
 ## Commands
 
 ```text
@@ -46,10 +48,9 @@ You no longer need `LIVE_POLL_SECONDS`, `LIVE_MAX_MINUTES`, `LIVE_TOP_TEAMS`, `T
 /bot_status
 ```
 
-### Example
+## Railway update
 
-```text
-/players_live screenshot:<image> mode:Duos region:NAC platform:pc
-```
-
-The bot then checks Fortnite Tracker every 10 seconds for 27 minutes, tracks all returned duo teams, shows individual PR and team PR, marks eliminations, and provides sorting plus page controls.
+1. Extract the ZIP.
+2. Replace the old files in the root of your GitHub repository with every extracted file.
+3. Commit the update.
+4. In Railway, redeploy with the build cache cleared.

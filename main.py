@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -10,11 +12,12 @@ from typing import Optional
 import discord
 from aiohttp import web
 from discord import app_commands
+from PIL import Image, ImageDraw, ImageFont
 
 from config import settings
 from models import PlayerResult, TeamResult
 from ocr import extract_session_id_from_image, normalize_session_id
-from tracker import LobbyScoutError, fill_missing_pr, scrape_session
+from tracker import LobbyScoutError, fill_missing_pr, player_key, scrape_session
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("lobby-scout")
@@ -117,7 +120,7 @@ def sort_teams(teams: list[TeamResult], mode: str) -> list[TeamResult]:
 
 
 def player_pr_map(players: list[PlayerResult]) -> dict[str, float]:
-    return {p.name.lower(): float(p.pr or 0) for p in players}
+    return {player_key(p.name): float(p.pr or 0) for p in players}
 
 
 def team_names_with_pr(team: TeamResult, pr_by_name: dict[str, float] | None = None) -> str:
@@ -126,7 +129,7 @@ def team_names_with_pr(team: TeamResult, pr_by_name: dict[str, float] | None = N
     pr_by_name = pr_by_name or {}
     parts = []
     for name in team.players:
-        individual_pr = pr_by_name.get(name.lower(), 0.0)
+        individual_pr = pr_by_name.get(player_key(name), 0.0)
         parts.append(f"**{name}** `({fmt_num(individual_pr)} PR)`")
     return " / ".join(parts)
 
@@ -156,6 +159,176 @@ def player_line(rank: int, player: PlayerResult) -> str:
     dmg = f" • {fmt_num(player.damage)} dmg" if player.damage is not None else ""
     place = f" • place #{player.placement}" if player.placement is not None else ""
     return f"`{rank:02}` **{player.name}** — `{fmt_num(player.pr)} PR`{kills}{dmg}{place}"
+
+
+_FONT_CACHE: dict[tuple[int, bool], ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
+
+
+def _font(size: int, bold: bool = False):
+    key = (size, bold)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    candidates = [
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                _FONT_CACHE[key] = ImageFont.truetype(path, size=size)
+                return _FONT_CACHE[key]
+            except OSError:
+                pass
+    _FONT_CACHE[key] = ImageFont.load_default()
+    return _FONT_CACHE[key]
+
+
+def _compact_num(value: float | int | None) -> str:
+    value = float(value or 0)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 10_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:,.0f}"
+
+
+def _fit_text(draw: ImageDraw.ImageDraw, text: str, max_width: int, start_size: int, bold: bool = False, min_size: int = 12):
+    size = start_size
+    while size > min_size:
+        font = _font(size, bold)
+        if draw.textbbox((0, 0), text, font=font)[2] <= max_width:
+            return font, text
+        size -= 1
+    font = _font(min_size, bold)
+    shortened = text
+    while shortened and draw.textbbox((0, 0), shortened + "…", font=font)[2] > max_width:
+        shortened = shortened[:-1]
+    return font, (shortened + "…") if shortened != text else text
+
+
+def render_lobby_dashboard(
+    teams: list[TeamResult],
+    players: list[PlayerResult],
+    sort_mode: str,
+    lobby_format: str,
+    session_id: str,
+    region: str,
+    platform: str,
+    elapsed_seconds: int = 0,
+    max_seconds: int = 0,
+    new_death_keys: set[str] | None = None,
+    final: bool = False,
+) -> bytes:
+    """Render the complete lobby into one PNG attachment so no pagination is required."""
+    info = format_info(lobby_format)
+    ordered = sort_teams(teams, sort_mode)
+    pr_by_name = player_pr_map(players)
+    expected = int(info["expected_teams"])
+    known, alive, eliminated = summarize_status(ordered)
+    pending = max(0, expected - known)
+    new_death_keys = new_death_keys or set()
+
+    team_size = int(info["team_size"])
+    column_width = {1: 560, 2: 900, 3: 1090, 4: 1420}.get(team_size, 900)
+    rows_per_column = 25
+    columns = max(1, math.ceil(max(1, len(ordered)) / rows_per_column))
+    columns = min(columns, 4)
+    margin = 28
+    gap = 18
+    header_h = 190
+    footer_h = 54
+    row_h = 62
+    width = margin * 2 + columns * column_width + (columns - 1) * gap
+    height = header_h + rows_per_column * row_h + footer_h
+
+    image = Image.new("RGB", (width, height), "#0e1118")
+    draw = ImageDraw.Draw(image)
+
+    # Header
+    draw.rounded_rectangle((margin, 22, width - margin, header_h - 18), radius=20, fill="#171c28", outline="#2b3345", width=2)
+    draw.text((margin + 24, 40), "LOBBY SCOUT LIVE" if not final else "LOBBY SCOUT RESULTS", font=_font(34, True), fill="#f5f7fb")
+    state_text = "ENDED" if final else "LIVE • 10s refresh"
+    state_color = "#9aa4b2" if final else "#57e389"
+    state_font = _font(20, True)
+    state_w = draw.textbbox((0, 0), state_text, font=state_font)[2]
+    draw.text((width - margin - 24 - state_w, 48), state_text, font=state_font, fill=state_color)
+
+    session_short = session_id if len(session_id) <= 36 else session_id[:33] + "…"
+    draw.text((margin + 24, 88), f"{info['label']} • {region} • {platform.upper()} • {session_short}", font=_font(20), fill="#aeb8c8")
+    sort_label = SORT_CHOICES.get(sort_mode, sort_mode)
+    summary = f"Tracked {known}/{expected}  •  Alive {alive}  •  Eliminated {eliminated}  •  Pending {pending}  •  Sort: {sort_label}"
+    draw.text((margin + 24, 122), summary, font=_font(21, True), fill="#d9dfeb")
+    if max_seconds:
+        timer = f"Timer {elapsed_seconds // 60}:{elapsed_seconds % 60:02} / {max_seconds // 60}:{max_seconds % 60:02}"
+        draw.text((margin + 24, 154), timer, font=_font(17), fill="#7f8ba1")
+
+    if not ordered:
+        draw.text((margin + 30, header_h + 40), "No teams found yet. Fortnite Tracker may still be processing the session.", font=_font(28, True), fill="#c8d0de")
+    else:
+        for index, team in enumerate(ordered):
+            col = index // rows_per_column
+            row = index % rows_per_column
+            if col >= columns:
+                break
+            x0 = margin + col * (column_width + gap)
+            y0 = header_h + row * row_h
+            x1 = x0 + column_width
+            y1 = y0 + row_h - 5
+
+            is_new = team_key(team) in new_death_keys
+            base_fill = "#171c28" if row % 2 == 0 else "#141924"
+            outline = "#ffb454" if is_new else "#293145"
+            draw.rounded_rectangle((x0, y0, x1, y1), radius=10, fill=base_fill, outline=outline, width=3 if is_new else 1)
+
+            status_color = "#ff6375" if team.is_eliminated else "#4fd28a"
+            draw.rounded_rectangle((x0 + 9, y0 + 9, x0 + 84, y0 + 37), radius=8, fill=status_color)
+            status_text = "NEW OUT" if is_new else ("OUT" if team.is_eliminated else "ALIVE")
+            status_font, status_text = _fit_text(draw, status_text, 65, 14, True, 10)
+            sw = draw.textbbox((0, 0), status_text, font=status_font)[2]
+            draw.text((x0 + 46 - sw / 2, y0 + 15), status_text, font=status_font, fill="#0e1118")
+
+            rank_text = f"#{index + 1:02}"
+            draw.text((x0 + 94, y0 + 11), rank_text, font=_font(17, True), fill="#8e9bb0")
+
+            player_parts = []
+            for name in team.players:
+                player_parts.append(f"{name} ({_compact_num(pr_by_name.get(player_key(name), 0))} PR)")
+            names_text = "  /  ".join(player_parts) if player_parts else "Unknown team"
+            names_x = x0 + 146
+            names_max = column_width - 355
+            names_font, names_text = _fit_text(draw, names_text, max(150, names_max), 19, True, 11)
+            draw.text((names_x, y0 + 8), names_text, font=names_font, fill="#f3f6fb")
+
+            if team.is_eliminated:
+                place = f"#{team.placement}" if team.placement is not None else "#?"
+                when = f" • {team.eliminated_at}" if team.eliminated_at else ""
+                detail = f"Placed {place}{when}"
+            else:
+                detail = "Still alive"
+            extras = []
+            if team.eliminations is not None:
+                extras.append(f"{team.eliminations} elim")
+            if team.points is not None:
+                extras.append(f"{team.points} pts")
+            if extras:
+                detail += " • " + " • ".join(extras)
+            detail_font, detail = _fit_text(draw, detail, max(150, names_max), 15, False, 10)
+            draw.text((names_x, y0 + 36), detail, font=detail_font, fill="#9ca8ba")
+
+            team_pr = f"TEAM {_compact_num(team.combined_pr)} PR"
+            team_pr_font = _font(17, True)
+            tw = draw.textbbox((0, 0), team_pr, font=team_pr_font)[2]
+            draw.text((x1 - tw - 15, y0 + 20), team_pr, font=team_pr_font, fill="#79a7ff")
+
+    footer = "All returned teams are shown in this single image. PR is displayed for alive and eliminated players."
+    footer_font = _font(16)
+    fw = draw.textbbox((0, 0), footer, font=footer_font)[2]
+    draw.text(((width - fw) / 2, height - 37), footer, font=footer_font, fill="#778399")
+
+    output = io.BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
 
 
 def make_text_pages(lines: list[str], max_chars: int = 950) -> list[str]:
@@ -217,12 +390,9 @@ class StaticLobbyState:
 
 def make_static_embed(state: StaticLobbyState, detected_from_ocr: bool = False) -> discord.Embed:
     info = format_info(state.lobby_format)
-    pages = state.pages()
-    state.page = clamp_page(state.page, pages)
     expected = int(info["expected_teams"])
     known = len(state.teams) if state.teams else len(state.players)
     unit = "players" if state.lobby_format == "solos" else "teams"
-
     embed = discord.Embed(
         title="Lobby Scout Results",
         description=(
@@ -233,20 +403,13 @@ def make_static_embed(state: StaticLobbyState, detected_from_ocr: bool = False) 
     )
     embed.add_field(
         name="Lobby Coverage",
-        value=(
-            f"Found `{known}` of up to `{expected}` {unit}. "
-            "Every returned entry is included across the pages below."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=f"PR Ranking • Page {state.page + 1}/{len(pages)}",
-        value=pages[state.page][:1024],
+        value=f"Found `{known}` of up to `{expected}` {unit}. The complete lobby is shown in the attached dashboard image.",
         inline=False,
     )
     if detected_from_ocr:
         embed.add_field(name="OCR", value="Session ID extracted from the uploaded screenshot.", inline=False)
-    embed.set_footer(text="Use Previous/Next to view the full lobby. Sorted by highest combined PR.")
+    embed.set_image(url="attachment://lobby-dashboard.png")
+    embed.set_footer(text="All teams are in one message. Individual PR and combined team PR are included.")
     return embed
 
 
@@ -365,9 +528,9 @@ class LiveMonitor:
     async def refresh(self) -> None:
         data = await scrape_session(self.session_id_or_url)
         players = await fill_missing_pr(data["players"], self.region, self.platform)
-        pr_by_name = {p.name.lower(): p.pr for p in players}
+        pr_by_name = {player_key(p.name): p.pr for p in players}
         for team in data["teams"]:
-            team.combined_pr = sum(pr_by_name.get(name.lower(), 0.0) for name in team.players)
+            team.combined_pr = sum(pr_by_name.get(player_key(name), 0.0) for name in team.players)
 
         teams = data["teams"]
         current_dead = {team_key(t) for t in teams if t.is_eliminated}
@@ -386,7 +549,6 @@ class LiveMonitor:
             players=players,
             teams=teams,
         )
-        self.page = clamp_page(self.page, self.pages())
 
     async def refresh_and_edit(self) -> None:
         try:
@@ -399,7 +561,27 @@ class LiveMonitor:
     async def edit_message(self, final: bool = False) -> None:
         if self.view:
             self.view.sync_controls()
-        await self.message.edit(embed=make_live_embed(self, final=final), view=self.view)
+        embed = make_live_embed(self, final=final)
+        if self.snapshot:
+            new_keys = {team_key(t) for t in self.new_deaths}
+            image_bytes = await asyncio.to_thread(
+                render_lobby_dashboard,
+                self.snapshot.teams,
+                self.snapshot.players,
+                self.sort_mode,
+                self.lobby_format,
+                self.session_id,
+                self.region,
+                self.platform,
+                int(time.monotonic() - self.started_at),
+                self.max_minutes * 60,
+                new_keys,
+                final or self.stopped,
+            )
+            file = discord.File(io.BytesIO(image_bytes), filename="lobby-dashboard.png")
+            await self.message.edit(embed=embed, attachments=[file], view=self.view)
+        else:
+            await self.message.edit(embed=embed, attachments=[], view=self.view)
 
 
 class SortSelect(discord.ui.Select):
@@ -417,7 +599,8 @@ class SortSelect(discord.ui.Select):
         if self.monitor.view:
             self.monitor.view.refresh_select_options()
             self.monitor.view.sync_controls()
-        await interaction.response.edit_message(embed=make_live_embed(self.monitor), view=self.monitor.view)
+        await interaction.response.defer(thinking=False)
+        await self.monitor.edit_message()
 
 
 class LivePreviousButton(discord.ui.Button):
@@ -463,20 +646,17 @@ class StopButton(discord.ui.Button):
         self.monitor.stop()
         if self.monitor.view:
             self.monitor.view.disable_all_items()
-        await interaction.response.edit_message(embed=make_live_embed(self.monitor, final=True), view=self.monitor.view)
+        await interaction.response.defer(thinking=False)
+        await self.monitor.edit_message(final=True)
 
 
 class LiveLobbyView(discord.ui.View):
     def __init__(self, monitor: LiveMonitor):
         super().__init__(timeout=monitor.max_minutes * 60 + 120)
         self.monitor = monitor
-        self.previous = LivePreviousButton(monitor)
-        self.next = LiveNextButton(monitor)
         self.refresh = RefreshButton(monitor)
         self.stop = StopButton(monitor)
         self.add_item(SortSelect(monitor))
-        self.add_item(self.previous)
-        self.add_item(self.next)
         self.add_item(self.refresh)
         self.add_item(self.stop)
         self.sync_controls()
@@ -488,10 +668,12 @@ class LiveLobbyView(discord.ui.View):
         self.add_item(SortSelect(self.monitor))
 
     def sync_controls(self) -> None:
-        pages = self.monitor.pages()
-        self.monitor.page = clamp_page(self.monitor.page, pages)
-        self.previous.disabled = self.monitor.page <= 0 or self.monitor.stopped
-        self.next.disabled = self.monitor.page >= len(pages) - 1 or self.monitor.stopped
+        self.refresh.disabled = self.monitor.stopped
+        self.stop.disabled = self.monitor.stopped
+
+    def disable_all_items(self) -> None:
+        for item in self.children:
+            item.disabled = True
 
     async def on_timeout(self) -> None:
         self.monitor.stop()
@@ -515,68 +697,35 @@ def make_live_embed(monitor: LiveMonitor, final: bool = False) -> discord.Embed:
         ),
         color=0x2ECC71 if not final and not monitor.stopped else 0x95A5A6,
     )
-
     elapsed = int(time.monotonic() - monitor.started_at)
     max_seconds = monitor.max_minutes * 60
-
     if not snap:
         embed.add_field(name="Status", value="Starting live monitor…", inline=False)
     else:
-        teams = snap.teams
-        players = snap.players
-        pr_by_name = player_pr_map(players)
-        known, alive, eliminated = summarize_status(teams)
+        known, alive, eliminated = summarize_status(snap.teams)
         expected = int(info["expected_teams"])
         pending = max(0, expected - known)
         sort_label = SORT_CHOICES.get(monitor.sort_mode, monitor.sort_mode)
         unit = "players" if monitor.lobby_format == "solos" else "teams"
-        pages = monitor.pages()
-        monitor.page = clamp_page(monitor.page, pages)
-
         embed.add_field(
             name="Live Summary",
             value=(
-                f"**Format:** `{info['label']}` • **Tracked:** `{known}/{expected}` {unit} • "
-                f"**Pending:** `{pending}`\n"
-                f"**Alive/incomplete:** `{alive}` • **Eliminated:** `{eliminated}` • "
-                f"**Sort:** `{sort_label}`\n"
-                f"**Auto refresh:** `{monitor.poll_seconds}s` • "
+                f"**Tracked:** `{known}/{expected}` {unit} • **Pending:** `{pending}` • "
+                f"**Alive:** `{alive}` • **Eliminated:** `{eliminated}`\n"
+                f"**Sort:** `{sort_label}` • **Refresh:** `{monitor.poll_seconds}s` • "
                 f"**Timer:** `{elapsed//60}:{elapsed%60:02}` / `{max_seconds//60}:{max_seconds%60:02}`"
             ),
             inline=False,
         )
-
         if monitor.new_deaths:
-            death_lines = [team_line(i, t, pr_by_name) for i, t in enumerate(monitor.new_deaths[:4], start=1)]
-            embed.add_field(
-                name="🚨 Newly Eliminated",
-                value=make_text_pages(death_lines, max_chars=950)[0][:1024],
-                inline=False,
-            )
-
-        embed.add_field(
-            name=f"Full Lobby • Page {monitor.page + 1}/{len(pages)}",
-            value=pages[monitor.page][:1024],
-            inline=False,
-        )
-
-        top_players = sorted(players, key=lambda p: p.pr, reverse=True)[:3]
-        if top_players:
-            embed.add_field(
-                name="Highest PR Players",
-                value="\n".join(player_line(i, p) for i, p in enumerate(top_players, start=1))[:1024],
-                inline=False,
-            )
-
+            names = []
+            for team in monitor.new_deaths[:6]:
+                names.append(f"💀 {team.display_name}")
+            embed.add_field(name="Newly Eliminated", value="\n".join(names)[:1024], inline=False)
+        embed.set_image(url="attachment://lobby-dashboard.png")
     if monitor.last_error:
         embed.add_field(name="Last refresh warning", value=f"`{monitor.last_error[:900]}`", inline=False)
-
-    embed.set_footer(
-        text=(
-            "Every returned team is monitored from the first refresh. Pages only control what is visible. "
-            "No memory reading or packet sniffing."
-        )
-    )
+    embed.set_footer(text="One message, one full-lobby image. Sort, refresh, and stop controls remain below.")
     return embed
 
 
@@ -600,9 +749,9 @@ async def handle_session_lookup(
     players = await fill_missing_pr(data["players"], region, platform)
     teams = data["teams"]
 
-    pr_by_name = {p.name.lower(): p.pr for p in players}
+    pr_by_name = {player_key(p.name): p.pr for p in players}
     for team in teams:
-        team.combined_pr = sum(pr_by_name.get(name.lower(), 0.0) for name in team.players)
+        team.combined_pr = sum(pr_by_name.get(player_key(name), 0.0) for name in team.players)
 
     state = StaticLobbyState(
         session_id=data["session_id"],
@@ -613,8 +762,22 @@ async def handle_session_lookup(
         platform=platform,
         lobby_format=lobby_format,
     )
-    view = StaticLobbyView(state, detected_from_ocr)
-    await interaction.followup.send(embed=make_static_embed(state, detected_from_ocr), view=view)
+    image_bytes = await asyncio.to_thread(
+        render_lobby_dashboard,
+        teams,
+        players,
+        "pr",
+        lobby_format,
+        data["session_id"],
+        region,
+        platform,
+        0,
+        0,
+        set(),
+        True,
+    )
+    file = discord.File(io.BytesIO(image_bytes), filename="lobby-dashboard.png")
+    await interaction.followup.send(embed=make_static_embed(state, detected_from_ocr), file=file)
 
 
 async def extract_id_or_reply(
