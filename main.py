@@ -10,10 +10,10 @@ import discord
 from discord import app_commands
 from aiohttp import web
 
-from lobby_scout.config import settings
-from lobby_scout.ocr import extract_session_id_from_image, normalize_session_id
-from lobby_scout.tracker import scrape_session, fill_missing_pr, LobbyScoutError
-from lobby_scout.models import PlayerResult, TeamResult
+from config import settings
+from ocr import extract_session_id_from_image, normalize_session_id
+from tracker import scrape_session, fill_missing_pr, LobbyScoutError
+from models import PlayerResult, TeamResult
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s:%(name)s: %(message)s")
 log = logging.getLogger("lobby-scout")

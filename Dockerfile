@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# tesseract = OCR engine, chromium deps = Playwright browser support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tesseract-ocr \
     libtesseract-dev \
@@ -28,16 +28,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxfixes3 \
     libxrandr2 \
-    wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
 
-COPY . .
+# Every project file is stored directly in the repository root.
+COPY . /app/
 
-# Use system Chromium to keep Railway deploy lighter.
+RUN test -f /app/main.py \
+    && test -f /app/config.py \
+    && test -f /app/models.py \
+    && test -f /app/ocr.py \
+    && test -f /app/tracker.py \
+    && pip install -r /app/requirements.txt
+
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-CMD ["python", "main.py"]
+CMD ["python", "-u", "/app/main.py"]
