@@ -93,149 +93,6 @@ def team_key(team: TeamResult) -> str:
     return f"unknown:{id(team)}"
 
 
-
-
-def canonical_member_names(names: list[str], team_size: int) -> list[str]:
-    cleaned = []
-    seen = set()
-    for raw in names or []:
-        name = str(raw or '').strip()
-        if not name:
-            continue
-        key = player_key(name)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(name)
-    cleaned.sort(key=lambda n: player_key(n))
-    if team_size > 0:
-        return cleaned[:team_size]
-    return cleaned
-
-
-def canonical_team_signature(team: TeamResult, lobby_format: str) -> str:
-    info = format_info(lobby_format)
-    team_size = int(info["team_size"])
-    names = canonical_member_names(team.players, team_size)
-    if names:
-        return "|".join(player_key(n) for n in names)
-    if team.placement is not None:
-        return f"place:{team.placement}"
-    return "unknown"
-
-
-def merge_team_records(existing: TeamResult, incoming: TeamResult, lobby_format: str) -> TeamResult:
-    info = format_info(lobby_format)
-    team_size = int(info["team_size"])
-    merged_names = canonical_member_names(existing.players + incoming.players, team_size)
-    existing.players = merged_names
-
-    # Strongest PR is kept after recompute, but preserve whichever side already had it.
-    existing.combined_pr = max(existing.combined_pr or 0.0, incoming.combined_pr or 0.0)
-
-    for attr in ("points", "eliminations"):
-        a = getattr(existing, attr)
-        b = getattr(incoming, attr)
-        if a is None or (b is not None and b > a):
-            setattr(existing, attr, b)
-
-    # A placement or explicit elimination always wins over an 'alive' duplicate row.
-    placements = [p for p in (existing.placement, incoming.placement) if p is not None]
-    if placements:
-        existing.placement = min(placements)
-    if incoming.time_played and not existing.time_played:
-        existing.time_played = incoming.time_played
-    if incoming.damage_text and not existing.damage_text:
-        existing.damage_text = incoming.damage_text
-
-    incoming_dead = incoming.is_eliminated or (incoming.placement is not None and incoming.placement > 1)
-    existing_dead = existing.is_eliminated or (existing.placement is not None and existing.placement > 1)
-    existing.is_eliminated = existing_dead or incoming_dead
-
-    if existing.is_eliminated:
-        # Prefer the most reliable/earliest elimination order and any known time.
-        orders = [o for o in (existing.eliminated_order, incoming.eliminated_order) if o is not None]
-        existing.eliminated_order = min(orders) if orders else existing.eliminated_order or incoming.eliminated_order
-        if not existing.eliminated_at and incoming.eliminated_at:
-            existing.eliminated_at = incoming.eliminated_at
-        if not existing.eliminated_at and existing.time_played:
-            existing.eliminated_at = existing.time_played
-    else:
-        existing.eliminated_at = None
-        existing.eliminated_order = None
-
-    return existing
-
-
-def normalize_lobby_snapshot(teams: list[TeamResult], players: list[PlayerResult], lobby_format: str) -> tuple[list[TeamResult], list[PlayerResult]]:
-    info = format_info(lobby_format)
-    team_size = int(info["team_size"])
-
-    # Deduplicate players by normalized name, keeping the highest PR and known stats.
-    merged_players = {}
-    for p in players:
-        key = player_key(p.name)
-        if not key:
-            continue
-        current = merged_players.get(key)
-        if current is None:
-            merged_players[key] = p
-            continue
-        if p.pr > current.pr:
-            current.pr = p.pr
-            current.source = p.source
-            current.name = p.name or current.name
-        for attr in ("placement", "kills", "damage", "team"):
-            if getattr(current, attr) is None and getattr(p, attr) is not None:
-                setattr(current, attr, getattr(p, attr))
-    merged_players_list = sorted(merged_players.values(), key=lambda p: p.pr, reverse=True)
-
-    deduped = {}
-    ordered = []
-    for team in teams:
-        team.players = canonical_member_names(team.players, team_size)
-        sig = canonical_team_signature(team, lobby_format)
-        if sig == 'unknown':
-            continue
-        if sig in deduped:
-            merge_team_records(deduped[sig], team, lobby_format)
-        else:
-            deduped[sig] = team
-            ordered.append(team)
-
-    pr_by_name = {player_key(p.name): float(p.pr or 0) for p in merged_players_list}
-    for team in ordered:
-        team.players = canonical_member_names(team.players, team_size)
-        team.combined_pr = sum(pr_by_name.get(player_key(name), 0.0) for name in team.players)
-        if team.placement is not None and team.placement > 1:
-            team.is_eliminated = True
-            if not team.eliminated_order:
-                team.eliminated_order = max(1, 101 - team.placement)
-        elif team.is_eliminated:
-            team.is_eliminated = True
-        else:
-            team.is_eliminated = False
-            team.eliminated_at = None
-            team.eliminated_order = None
-
-    return ordered, merged_players_list
-
-
-def public_base_url() -> str:
-    for env_name in ("PUBLIC_BASE_URL", "RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL"):
-        value = (os.getenv(env_name, "") or "").strip()
-        if not value:
-            continue
-        if value.startswith("http://") or value.startswith("https://"):
-            return value.rstrip("/")
-        return f"https://{value.strip('/')}"
-    return ""
-
-
-def live_web_url(message_id: int) -> str:
-    base = public_base_url()
-    return f"{base}/live/{message_id}" if base else ""
-
 def summarize_status(teams: list[TeamResult]) -> tuple[int, int, int]:
     known = len(teams)
     eliminated = sum(1 for t in teams if t.is_eliminated)
@@ -374,7 +231,7 @@ def render_lobby_dashboard(
     new_death_keys: set[str] | None = None,
     final: bool = False,
 ) -> bytes:
-    """Render the full lobby into one readable PNG attachment."""
+    """Render the complete lobby into one PNG attachment so no pagination is required."""
     info = format_info(lobby_format)
     ordered = sort_teams(teams, sort_mode)
     pr_by_name = player_pr_map(players)
@@ -383,102 +240,106 @@ def render_lobby_dashboard(
     pending = max(0, expected - known)
     new_death_keys = new_death_keys or set()
 
-    columns = max(1, min(4, math.ceil(max(1, len(ordered)) / 25)))
-    rows_per_column = 25
-    margin = 24
-    gap = 16
-    header_h = 126
-    footer_h = 36
-    row_h = 45
-    # Wider columns for larger teams but keep the board readable.
     team_size = int(info["team_size"])
-    base_col = {1: 430, 2: 690, 3: 860, 4: 980}.get(team_size, 690)
-    if columns >= 3:
-        base_col = int(base_col * 0.78)
-    col_w = base_col
-    width = margin * 2 + columns * col_w + (columns - 1) * gap
+    column_width = {1: 560, 2: 900, 3: 1090, 4: 1420}.get(team_size, 900)
+    rows_per_column = 25
+    columns = max(1, math.ceil(max(1, len(ordered)) / rows_per_column))
+    columns = min(columns, 4)
+    margin = 28
+    gap = 18
+    header_h = 190
+    footer_h = 54
+    row_h = 62
+    width = margin * 2 + columns * column_width + (columns - 1) * gap
     height = header_h + rows_per_column * row_h + footer_h
 
-    image = Image.new("RGB", (width, height), "#0b1020")
+    image = Image.new("RGB", (width, height), "#0e1118")
     draw = ImageDraw.Draw(image)
 
-    # Header block
-    draw.rounded_rectangle((margin, 18, width - margin, header_h - 16), radius=16, fill="#131a2a", outline="#26334d", width=2)
-    draw.text((margin + 18, 28), "LOBBY SCOUT LIVE" if not final else "LOBBY SCOUT RESULTS", font=_font(28, True), fill="#eef3ff")
-    state_text = "ENDED" if final else "LIVE • 10s"
-    state_color = "#a6b4cc" if final else "#4ade80"
-    tw = draw.textbbox((0, 0), state_text, font=_font(16, True))[2]
-    draw.text((width - margin - 18 - tw, 32), state_text, font=_font(16, True), fill=state_color)
+    # Header
+    draw.rounded_rectangle((margin, 22, width - margin, header_h - 18), radius=20, fill="#171c28", outline="#2b3345", width=2)
+    draw.text((margin + 24, 40), "LOBBY SCOUT LIVE" if not final else "LOBBY SCOUT RESULTS", font=_font(34, True), fill="#f5f7fb")
+    state_text = "ENDED" if final else "LIVE • 10s refresh"
+    state_color = "#9aa4b2" if final else "#57e389"
+    state_font = _font(20, True)
+    state_w = draw.textbbox((0, 0), state_text, font=state_font)[2]
+    draw.text((width - margin - 24 - state_w, 48), state_text, font=state_font, fill=state_color)
 
-    sid = session_id if len(session_id) <= 28 else session_id[:28] + "…"
-    draw.text((margin + 18, 62), f"{info['label']} • {region} • {platform.upper()} • {sid}", font=_font(16), fill="#9fb0c7")
+    session_short = session_id if len(session_id) <= 36 else session_id[:33] + "…"
+    draw.text((margin + 24, 88), f"{info['label']} • {region} • {platform.upper()} • {session_short}", font=_font(20), fill="#aeb8c8")
     sort_label = SORT_CHOICES.get(sort_mode, sort_mode)
-    summary = f"Tracked {known}/{expected} • Alive {alive} • Out {eliminated} • Pending {pending} • Sort: {sort_label}"
-    draw.text((margin + 18, 84), summary, font=_font(16, True), fill="#d7e1f3")
+    summary = f"Tracked {known}/{expected}  •  Alive {alive}  •  Eliminated {eliminated}  •  Pending {pending}  •  Sort: {sort_label}"
+    draw.text((margin + 24, 122), summary, font=_font(21, True), fill="#d9dfeb")
     if max_seconds:
-        timer = f"Timer {elapsed_seconds//60}:{elapsed_seconds%60:02} / {max_seconds//60}:{max_seconds%60:02}"
-        draw.text((margin + 18, 103), timer, font=_font(14), fill="#7f90aa")
+        timer = f"Timer {elapsed_seconds // 60}:{elapsed_seconds % 60:02} / {max_seconds // 60}:{max_seconds % 60:02}"
+        draw.text((margin + 24, 154), timer, font=_font(17), fill="#7f8ba1")
 
     if not ordered:
-        draw.text((margin + 20, header_h + 30), "No teams found yet. Fortnite Tracker may still be processing the session.", font=_font(22, True), fill="#d7e1f3")
+        draw.text((margin + 30, header_h + 40), "No teams found yet. Fortnite Tracker may still be processing the session.", font=_font(28, True), fill="#c8d0de")
     else:
-        for idx, team in enumerate(ordered):
-            col = idx // rows_per_column
-            row = idx % rows_per_column
+        for index, team in enumerate(ordered):
+            col = index // rows_per_column
+            row = index % rows_per_column
             if col >= columns:
                 break
-            x0 = margin + col * (col_w + gap)
+            x0 = margin + col * (column_width + gap)
             y0 = header_h + row * row_h
-            x1 = x0 + col_w
-            y1 = y0 + row_h - 4
-            fill = "#121a2b" if row % 2 == 0 else "#101727"
-            border = "#32415f"
-            if team_key(team) in new_death_keys:
-                border = "#f6c453"
-            draw.rounded_rectangle((x0, y0, x1, y1), radius=10, fill=fill, outline=border, width=2 if border != "#32415f" else 1)
+            x1 = x0 + column_width
+            y1 = y0 + row_h - 5
 
-            # status chip
-            is_out = team.is_eliminated
-            chip = "#f87171" if is_out else "#34d399"
-            label = "OUT" if is_out else "LIVE"
-            if team_key(team) in new_death_keys:
-                label = "NEW"
-                chip = "#f6c453"
-            draw.rounded_rectangle((x0 + 8, y0 + 9, x0 + 56, y0 + 27), radius=8, fill=chip)
-            lw = draw.textbbox((0, 0), label, font=_font(11, True))[2]
-            draw.text((x0 + 32 - lw / 2, y0 + 12), label, font=_font(11, True), fill="#0b1020")
+            is_new = team_key(team) in new_death_keys
+            base_fill = "#171c28" if row % 2 == 0 else "#141924"
+            outline = "#ffb454" if is_new else "#293145"
+            draw.rounded_rectangle((x0, y0, x1, y1), radius=10, fill=base_fill, outline=outline, width=3 if is_new else 1)
 
-            draw.text((x0 + 63, y0 + 8), f"#{idx+1:02}", font=_font(13, True), fill="#90a2bf")
-            team_pr = _compact_num(team.combined_pr)
-            pr_text = f"{team_pr} PR"
-            prw = draw.textbbox((0, 0), pr_text, font=_font(13, True))[2]
-            draw.text((x1 - 12 - prw, y0 + 8), pr_text, font=_font(13, True), fill="#7eb4ff")
+            status_color = "#ff6375" if team.is_eliminated else "#4fd28a"
+            draw.rounded_rectangle((x0 + 9, y0 + 9, x0 + 84, y0 + 37), radius=8, fill=status_color)
+            status_text = "NEW OUT" if is_new else ("OUT" if team.is_eliminated else "ALIVE")
+            status_font, status_text = _fit_text(draw, status_text, 65, 14, True, 10)
+            sw = draw.textbbox((0, 0), status_text, font=status_font)[2]
+            draw.text((x0 + 46 - sw / 2, y0 + 15), status_text, font=status_font, fill="#0e1118")
 
-            parts = [f"{name} ({_compact_num(pr_by_name.get(player_key(name),0))})" for name in team.players]
-            names = " / ".join(parts) if parts else "Unknown team"
-            name_font, names = _fit_text(draw, names, col_w - 150, 16, True, 11)
-            draw.text((x0 + 110, y0 + 6), names, font=name_font, fill="#f4f7fc")
+            rank_text = f"#{index + 1:02}"
+            draw.text((x0 + 94, y0 + 11), rank_text, font=_font(17, True), fill="#8e9bb0")
 
-            if is_out:
+            player_parts = []
+            for name in team.players:
+                player_parts.append(f"{name} ({_compact_num(pr_by_name.get(player_key(name), 0))} PR)")
+            names_text = "  /  ".join(player_parts) if player_parts else "Unknown team"
+            names_x = x0 + 146
+            names_max = column_width - 355
+            names_font, names_text = _fit_text(draw, names_text, max(150, names_max), 19, True, 11)
+            draw.text((names_x, y0 + 8), names_text, font=names_font, fill="#f3f6fb")
+
+            if team.is_eliminated:
                 place = f"#{team.placement}" if team.placement is not None else "#?"
-                detail = f"Out {place}"
+                when = f" • {team.eliminated_at}" if team.eliminated_at else ""
+                detail = f"Placed {place}{when}"
             else:
-                detail = "Alive"
+                detail = "Still alive"
+            extras = []
             if team.eliminations is not None:
-                detail += f" • {team.eliminations} elim"
+                extras.append(f"{team.eliminations} elim")
             if team.points is not None:
-                detail += f" • {team.points} pts"
-            df, detail = _fit_text(draw, detail, col_w - 122, 13, False, 10)
-            draw.text((x0 + 110, y0 + 24), detail, font=df, fill="#95a6bf")
+                extras.append(f"{team.points} pts")
+            if extras:
+                detail += " • " + " • ".join(extras)
+            detail_font, detail = _fit_text(draw, detail, max(150, names_max), 15, False, 10)
+            draw.text((names_x, y0 + 36), detail, font=detail_font, fill="#9ca8ba")
 
-    footer = "One team per row. Player PR stays visible for alive and eliminated teams."
-    fw = draw.textbbox((0, 0), footer, font=_font(13))[2]
-    draw.text(((width - fw) / 2, height - 24), footer, font=_font(13), fill="#71829d")
+            team_pr = f"TEAM {_compact_num(team.combined_pr)} PR"
+            team_pr_font = _font(17, True)
+            tw = draw.textbbox((0, 0), team_pr, font=team_pr_font)[2]
+            draw.text((x1 - tw - 15, y0 + 20), team_pr, font=team_pr_font, fill="#79a7ff")
+
+    footer = "All returned teams are shown in this single image. PR is displayed for alive and eliminated players."
+    footer_font = _font(16)
+    fw = draw.textbbox((0, 0), footer, font=footer_font)[2]
+    draw.text(((width - fw) / 2, height - 37), footer, font=footer_font, fill="#778399")
 
     output = io.BytesIO()
     image.save(output, format="PNG", optimize=True)
     return output.getvalue()
-
 
 
 def make_text_pages(lines: list[str], max_chars: int = 950) -> list[str]:
@@ -686,8 +547,11 @@ class LiveMonitor:
     async def refresh(self) -> None:
         data = await scrape_session(self.session_id_or_url)
         players = await fill_missing_pr(data["players"], self.region, self.platform)
-        teams, players = normalize_lobby_snapshot(data["teams"], players, self.lobby_format)
+        pr_by_name = {player_key(p.name): p.pr for p in players}
+        for team in data["teams"]:
+            team.combined_pr = sum(pr_by_name.get(player_key(name), 0.0) for name in team.players)
 
+        teams = data["teams"]
         current_dead = {team_key(t) for t in teams if t.is_eliminated}
         if self.refresh_count == 0:
             self.new_deaths = []
@@ -825,107 +689,6 @@ class StopButton(discord.ui.Button):
             active_monitors.pop(self.monitor.message.id, None)
 
 
-
-
-class OpenWebButton(discord.ui.Button):
-    def __init__(self, monitor: LiveMonitor):
-        self.monitor = monitor
-        super().__init__(style=discord.ButtonStyle.link, label="Open Web View", emoji="🌐", url=live_web_url(monitor.message.id), row=1)
-
-
-def live_rows_for_web(monitor: LiveMonitor) -> list[dict]:
-    if not monitor.snapshot:
-        return []
-    pr_by_name = player_pr_map(monitor.snapshot.players)
-    rows = []
-    for idx, team in enumerate(sort_teams(monitor.snapshot.teams, monitor.sort_mode), start=1):
-        players = [{"name": name, "pr": pr_by_name.get(player_key(name), 0.0)} for name in team.players]
-        rows.append({
-            "rank": idx,
-            "status": "out" if team.is_eliminated else "alive",
-            "players": players,
-            "team_pr": team.combined_pr,
-            "placement": team.placement,
-            "eliminations": team.eliminations,
-            "points": team.points,
-        })
-    return rows
-
-
-def live_payload(monitor: LiveMonitor) -> dict:
-    snap = monitor.snapshot
-    info = format_info(monitor.lobby_format)
-    if snap:
-        known, alive, eliminated = summarize_status(snap.teams)
-    else:
-        known = alive = eliminated = 0
-    expected = int(info["expected_teams"])
-    return {
-        "ok": True,
-        "message_id": monitor.message.id,
-        "session_id": monitor.session_id,
-        "mode": info["label"],
-        "region": monitor.region,
-        "platform": monitor.platform,
-        "sort": SORT_CHOICES.get(monitor.sort_mode, monitor.sort_mode),
-        "poll_seconds": monitor.poll_seconds,
-        "max_minutes": monitor.max_minutes,
-        "elapsed_seconds": int(time.monotonic() - monitor.started_at),
-        "tracked": known,
-        "expected": expected,
-        "alive": alive,
-        "eliminated": eliminated,
-        "pending": max(0, expected - known),
-        "rows": live_rows_for_web(monitor),
-        "new_deaths": [t.display_name for t in monitor.new_deaths[:8]],
-        "stopped": monitor.stopped,
-        "last_error": monitor.last_error,
-    }
-
-
-def live_html_page(message_id: int) -> str:
-    return f"""<!doctype html>
-<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Lobby Scout Live</title>
-<style>
-body{{margin:0;font-family:Inter,Arial,sans-serif;background:#0b1020;color:#eef3ff}}
-.wrap{{max-width:1400px;margin:0 auto;padding:20px}}
-.header{{background:#131a2a;border:1px solid #26334d;border-radius:16px;padding:16px 18px;margin-bottom:18px}}
-.meta{{color:#9fb0c7;font-size:14px;margin-top:4px}}
-.summary{{font-weight:700;margin-top:8px}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:12px}}
-.card{{background:#121a2b;border:1px solid #32415f;border-radius:12px;padding:10px 12px}}
-.top{{display:flex;justify-content:space-between;gap:10px;align-items:center}}
-.badge{{font-size:12px;font-weight:700;border-radius:999px;padding:4px 8px;color:#0b1020;display:inline-block}}
-.alive{{background:#34d399}} .out{{background:#f87171}}
-.name{{font-size:16px;font-weight:700;margin-top:6px;word-break:break-word}}
-.detail{{font-size:13px;color:#95a6bf;margin-top:4px}}
-.teampr{{font-size:13px;font-weight:700;color:#7eb4ff}}
-.small{{font-size:12px;color:#71829d}}
-</style></head><body><div class='wrap'>
-<div class='header'><div style='display:flex;justify-content:space-between;gap:12px;align-items:center'><div><div style='font-size:28px;font-weight:800'>LOBBY SCOUT WEB VIEW</div><div class='meta' id='meta'>Loading…</div><div class='summary' id='summary'></div><div class='small' id='newdeaths'></div></div><div class='small' id='clock'>Refreshing…</div></div></div>
-<div class='grid' id='grid'></div></div>
-<script>
-async function refresh(){{
- const res = await fetch('/api/live/{message_id}');
- const data = await res.json();
- document.getElementById('meta').textContent = `${{data.mode}} • ${{data.region}} • ${{data.platform.toUpperCase()}} • ${{data.session_id}}`;
- document.getElementById('summary').textContent = `Tracked ${{data.tracked}}/${{data.expected}} • Alive ${{data.alive}} • Out ${{data.eliminated}} • Pending ${{data.pending}} • Sort: ${{data.sort}}`;
- document.getElementById('clock').textContent = `${{data.stopped ? 'Ended' : 'Live'}} • refresh every ${{data.poll_seconds}}s`;
- document.getElementById('newdeaths').textContent = data.new_deaths.length ? `Newly eliminated: ${{data.new_deaths.join(' • ')}}` : '';
- const grid = document.getElementById('grid'); grid.innerHTML = '';
- for (const row of data.rows){{
-   const players = row.players.map(p => `${{p.name}} (${{Math.round(p.pr)}})`).join(' / ');
-   const detail = row.status === 'out' ? `Out #${{row.placement ?? '?'}}` : 'Alive';
-   const extras = [detail, row.eliminations != null ? `${{row.eliminations}} elim` : '', row.points != null ? `${{row.points}} pts` : ''].filter(Boolean).join(' • ');
-   const el = document.createElement('div'); el.className='card';
-   el.innerHTML = `<div class='top'><div><span class='badge ${{row.status}}'>${{row.status === 'out' ? 'OUT' : 'LIVE'}}</span> <span class='small'>#${{String(row.rank).padStart(2,'0')}}</span></div><div class='teampr'>${{Math.round(row.team_pr)}} PR</div></div><div class='name'>${{players}}</div><div class='detail'>${{extras}}</div>`;
-   grid.appendChild(el);
- }}
-}}
-refresh(); setInterval(refresh, 10000);
-</script></body></html>"""
-
 class LiveLobbyView(discord.ui.View):
     def __init__(self, monitor: LiveMonitor):
         super().__init__(timeout=monitor.max_minutes * 60 + 120)
@@ -935,8 +698,6 @@ class LiveLobbyView(discord.ui.View):
         self.add_item(SortSelect(monitor))
         self.add_item(self.refresh)
         self.add_item(self.stop)
-        if live_web_url(monitor.message.id):
-            self.add_item(OpenWebButton(monitor))
         self.sync_controls()
 
     def refresh_select_options(self) -> None:
@@ -1002,10 +763,7 @@ def make_live_embed(monitor: LiveMonitor, final: bool = False) -> discord.Embed:
         embed.set_image(url="attachment://lobby-dashboard.png")
     if monitor.last_error:
         embed.add_field(name="Last refresh warning", value=f"`{monitor.last_error[:900]}`", inline=False)
-    web_url = live_web_url(monitor.message.id)
-    if web_url:
-        embed.add_field(name="Web View", value=f"[Open live web dashboard]({web_url})", inline=False)
-    embed.set_footer(text="One message, one clean full-lobby image. Use the Web View button for a browser dashboard.")
+    embed.set_footer(text="One message, one full-lobby image. Sort, refresh, and stop controls remain below.")
     return embed
 
 
@@ -1027,7 +785,11 @@ async def handle_session_lookup(
 
     data = await scrape_session(session_id_or_url)
     players = await fill_missing_pr(data["players"], region, platform)
-    teams, players = normalize_lobby_snapshot(data["teams"], players, lobby_format)
+    teams = data["teams"]
+
+    pr_by_name = {player_key(p.name): p.pr for p in players}
+    for team in teams:
+        team.combined_pr = sum(pr_by_name.get(player_key(name), 0.0) for name in team.players)
 
     state = StaticLobbyState(
         session_id=data["session_id"],
@@ -1281,7 +1043,7 @@ async def players_live_id(
 async def bot_status(interaction: discord.Interaction):
     await interaction.response.send_message(
         (
-            f"Lobby Scout Pro v2.7 is online ✅ Active live monitors: `{len(active_monitors)}`\n"
+            f"Lobby Scout Pro v2.6 is online ✅ Active live monitors: `{len(active_monitors)}`\n"
             f"Live defaults: refresh every `{LIVE_POLL_SECONDS}s` for `{LIVE_MAX_MINUTES}` minutes."
         ),
         ephemeral=True,
@@ -1304,22 +1066,6 @@ async def on_ready():
         log.exception("Slash command sync failed")
 
 
-
-
-async def live_page(request: web.Request) -> web.Response:
-    message_id = int(request.match_info["message_id"])
-    if message_id not in active_monitors:
-        return web.Response(status=404, text="Live monitor not found")
-    return web.Response(text=live_html_page(message_id), content_type="text/html")
-
-
-async def live_api(request: web.Request) -> web.Response:
-    message_id = int(request.match_info["message_id"])
-    monitor = active_monitors.get(message_id)
-    if not monitor:
-        return web.json_response({"ok": False, "error": "not_found"}, status=404)
-    return web.json_response(live_payload(monitor))
-
 async def health(request: web.Request) -> web.Response:
     return web.json_response(
         {
@@ -1334,7 +1080,7 @@ async def health(request: web.Request) -> web.Response:
 
 async def start_health_server() -> None:
     app = web.Application()
-    app.add_routes([web.get("/", health), web.get("/health", health), web.get("/live/{message_id}", live_page), web.get("/api/live/{message_id}", live_api)])
+    app.add_routes([web.get("/", health), web.get("/health", health)])
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", settings.port)

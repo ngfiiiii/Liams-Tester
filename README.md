@@ -1,25 +1,29 @@
-# Lobby Scout Pro Live v2.5 — One-Message Dashboard
+# Lobby Scout Pro Live v2.6 — Stable 27-Minute Message Editing
 
-All project files stay directly in one folder. Upload every extracted file directly to the root of your GitHub repository.
+All project files are directly in one folder. Upload every extracted file to the root of your GitHub repository.
 
-## New in v2.5
+## Fixed in v2.6
 
-- The full lobby is rendered into **one dashboard image attached to one Discord message**.
-- Duos displays all returned teams in two columns, so a 50-team lobby no longer needs Previous/Next pages.
-- Solos, Trios, and Squads automatically choose enough columns to show the complete returned lobby in one image.
-- Each player keeps their individual PR whether their team is alive or eliminated.
-- Each row also shows combined team PR, alive/out status, placement, elimination time, eliminations, and points when Tracker provides them.
-- Newly eliminated teams are highlighted as **NEW OUT** on the next refresh.
-- The sort menu, Refresh button, and Stop Live button remain available.
-- Live polling remains fixed at **10 seconds** and automatically stops after **27 minutes**.
+This version fixes both errors:
 
-Discord may scale the image to fit the app window. On a small screen you may need to tap the image to read tiny text, but there is no lobby pagination and all returned teams are contained in the same Discord message.
+```text
+discord.errors.NotFound: 404 Not Found (error code: 10008): Unknown Message
+AttributeError: 'LiveLobbyView' object has no attribute 'disable_all_items'
+```
 
-## PR behavior
+### Why the 404 happened
 
-PR is collected from Fortnite Tracker's Stats table, live JSON responses, and available fallbacks. Alive/dead status does not remove PR: eliminated teams keep the same individual and combined PR values in the dashboard.
+The old live dashboard was created as a Discord interaction follow-up/webhook message. Interaction tokens are temporary, so a long-running monitor could lose the ability to edit that message before the full 27-minute session ended.
 
-A player may still show `0 PR` when Fortnite Tracker itself has no PR value for that account.
+The live dashboard is now sent as a normal bot/channel message. It can be edited throughout the entire monitor without depending on the temporary slash-command webhook token.
+
+### Other stability changes
+
+- If a user or moderator deletes the live dashboard, the monitor stops quietly instead of throwing an error every 10 seconds.
+- Finalization no longer relies on a custom `disable_all_items()` method; every component is disabled through a safe shared helper.
+- Clicking **Stop Live** no longer causes the monitor to finalize twice.
+- The monitor still refreshes every 10 seconds and stops automatically after 27 minutes.
+- The one-message full-lobby image, PR, alive/dead status, sorting, and elimination tracking are unchanged.
 
 ## Railway variables
 
@@ -51,6 +55,9 @@ TRN_API_KEY=
 ## Railway update
 
 1. Extract the ZIP.
-2. Replace the old files in the root of your GitHub repository with every extracted file.
-3. Commit the update.
-4. In Railway, redeploy with the build cache cleared.
+2. Replace all old files in the root of your GitHub repository with the extracted files.
+3. Commit the changes.
+4. In Railway, choose **Redeploy with cleared build cache**.
+5. Start a brand-new `/players_live` or `/players_live_id` monitor. Existing messages from the older deployment cannot be converted.
+
+The PyNaCl voice warning is harmless because this bot does not use Discord voice.

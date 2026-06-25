@@ -688,8 +688,7 @@ async def scrape_session(session_id_or_url: str) -> dict[str, Any]:
 
 def fetch_pr_from_trn(player_name: str, region: str, platform: str) -> float:
     """Optional fallback when the session page does not expose PR for a player."""
-    global TRN_RUNTIME_DISABLED, TRN_DISABLE_REASON
-    if not settings.trn_api_key or TRN_RUNTIME_DISABLED:
+    if not settings.trn_api_key:
         return 0.0
 
     cached = pr_cache.get(player_name, region, platform)
@@ -709,14 +708,7 @@ def fetch_pr_from_trn(player_name: str, region: str, platform: str) -> float:
             return 0.0
         data = response.json()
     except Exception as exc:
-        # Railway/host DNS failures are a non-fatal issue because the live session page usually already contains PR.
-        reason = str(exc)
-        if "Failed to resolve" in reason or "NameResolutionError" in reason:
-            TRN_RUNTIME_DISABLED = True
-            TRN_DISABLE_REASON = reason
-            log.warning("TRN PR fallback disabled for this runtime: %s", reason)
-        else:
-            log.warning("TRN PR lookup failed for %s: %s", player_name, exc)
+        log.warning("TRN PR lookup failed for %s: %s", player_name, exc)
         return 0.0
 
     def walk(obj: Any) -> list[float]:
